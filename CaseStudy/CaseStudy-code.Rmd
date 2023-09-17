@@ -1,0 +1,700 @@
+---
+title: "CaseStudy-code"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# .libPaths('Z:/User/Documents/R/win-library/4.1')
+# setwd('Z:/User/Documents/dynamic weighted network LSM/real data analysis')
+setwd('D:/my论文/keywords co-occurance network/paper/JASA App/ACC-20230915/CaseStudy')
+Sys.setenv(LANGUAGE = "en")
+```
+
+
+```{r, warning=FALSE}
+library(irlba)
+library(RSpectra)
+library(ggplot2)
+library(cowplot)
+library(reshape2)
+library(ggrepel)
+```
+
+## Initialization
+
+```{r}
+init.func <- function(N, D, Ti, node.exist, seed){
+  set.seed(seed)
+  alpha <- runif(N, -2, -1)
+  beta <- runif(Ti, -2, 2)
+  Z <- list()
+  for (t in 1:Ti) {
+    Nt <- node.exist.num[t]
+    Jmat <- diag(rep(1,Nt)) - matrix(1, Nt, Nt)/Nt
+    Z0 <- matrix(runif(Nt*D, -0.5, 0.5), Nt, D)
+    Z0 <- Jmat%*%Z0
+    Z0 <- qr.Q(qr(Z0))
+    Z0 <- Z0*sqrt(Nt*D/5)/norm(Z0,'F')
+    Z[[t]] <- Z0
+  }
+  return(list(Z=Z, alpha=alpha, beta=beta))
+}
+```
+
+## Optimization
+
+```{r}
+opt.func <- function(Z.ini, alpha.ini, beta.ini, A, X, node.exist, nu=0.5, step.size=0.2, epsi=0.0005, niter=500, trace=0){
+
+  N <- length(alpha.ini)
+  Ti <- length(beta.ini)
+  D <- dim(Z.ini[[1]])[2]
+  
+  # step size
+  step.size.z <- step.size/(Ti*N*D)
+  step.size.alpha <- step.size/(Ti*N)
+  step.size.beta <- step.size/sum(unlist(lapply(1:Ti, function(t) norm(X[[t]],'F')^2)))
+  
+  
+  diff <- 1
+  iter <- 0
+  obj <- -Inf
+  
+  Z <- list()
+  alpha <- rep(NA, N)
+  beta <- rep(NA, Ti)
+  
+  while (diff>epsi & iter<niter) {
+    Theta.hat <- lapply(1:Ti, function(t) alpha.ini[node.exist[[t]]] %*% t(rep(1,length(node.exist[[t]]))) + 
+                          rep(1,length(node.exist[[t]])) %*% t(alpha.ini[node.exist[[t]]]) + 
+                          Z.ini[[t]] %*% t(Z.ini[[t]]) + beta.ini[t]*X[[t]])
+     
+    obj1 <- lapply(1:Ti, function(t) (A[[t]] * Theta.hat[[t]] - exp(Theta.hat[[t]])) * 
+                     (matrix(rep(1, length(node.exist[[t]])), length(node.exist[[t]]), length(node.exist[[t]])) - 
+                        diag(1, length(node.exist[[t]]), length(node.exist[[t]]))))
+    tmp.obj <- sum(unlist(lapply(1:Ti, function(t) sum(obj1[[t]]))))
+    obj <- c(obj,tmp.obj)
+    if(trace==1){
+      print(iter)
+      print(diff)
+      print(tmp.obj)
+    }
+    
+    if(obj[length(obj)] < obj[length(obj)-1]){
+      step.size.z <- step.size.z * nu
+      step.size.alpha <- step.size.alpha * nu
+      step.size.beta <- step.size.beta * nu
+    }
+    
+    alpha.grad <- rep(0, N)
+    for (t in 1:Ti) {
+      Nt <- length(node.exist[[t]])
+      Theta.t <- alpha.ini[node.exist[[t]]] %*% t(rep(1,Nt)) + 
+        rep(1,Nt) %*% t(alpha.ini[node.exist[[t]]]) + 
+        Z.ini[[t]] %*% t(Z.ini[[t]]) + beta.ini[t]*X[[t]]
+      
+      Omega.t <- A[[t]] - exp(Theta.t)
+      Omega.t[Omega.t>2] <- 2  
+      Omega.t[Omega.t<-2] <- -2 
+      diag(Omega.t) <- 0
+      
+      Z.grad <- 2 * Omega.t %*% Z.ini[[t]]
+      alpha.grad[node.exist[[t]]] <- alpha.grad[node.exist[[t]]] + 2 * Omega.t %*% rep(1,Nt)
+      beta.grad <- sum(Omega.t * X[[t]])
+      
+      
+      Z[[t]] <- Z.ini[[t]] + step.size.z * Z.grad
+      
+      Jmat <- diag(rep(1,Nt)) - matrix(1, Nt, Nt)/Nt
+      Z[[t]] <- Jmat %*% Z[[t]]
+      Z[[t]] <- qr.Q(qr(Z[[t]]))
+      Z[[t]] <- Z[[t]]*sqrt(Nt*D/5)/norm(Z[[t]],'F')
+      
+      beta[t] <- beta.ini[t] + step.size.beta * beta.grad
+      
+    }
+    alpha <- alpha.ini + step.size.alpha * alpha.grad
+    
+    Z.diff.list <- c()
+    for (t in 1:Ti) {
+      dec <- svd(t(Z[[t]]) %*% Z.ini[[t]])
+      O <- dec$v %*% t(dec$u)
+      re0 <- norm(Z[[t]] - Z.ini[[t]] %*% O,'F')^2 / norm(Z.ini[[t]], 'F')^2
+      Z.diff.list <- c(Z.diff.list, re0)
+    }
+    Z.diff <- mean(Z.diff.list)
+    
+    
+    alpha.diff <- sum((alpha-alpha.ini)^2)/sum(alpha.ini^2)
+    beta.diff <- sum((beta-beta.ini)^2)/sum(beta.ini^2)
+    
+    diff <- max(Z.diff, alpha.diff, beta.diff)
+    
+    iter <- iter+1
+    
+    # update
+    Z.ini <- Z
+    alpha.ini <- alpha
+    beta.ini <- beta
+  }
+  
+  Theta.hat <- lapply(1:Ti, function(t) alpha[node.exist[[t]]] %*% t(rep(1,length(node.exist[[t]]))) + rep(1,length(node.exist[[t]])) %*% t(alpha[node.exist[[t]]]) + Z[[t]] %*% t(Z[[t]]) + beta[t]*X[[t]])
+  obj1 <- lapply(1:Ti, function(t) (A[[t]] * Theta.hat[[t]] - exp(Theta.hat[[t]])) * (matrix(rep(1, length(node.exist[[t]])*length(node.exist[[t]])), length(node.exist[[t]]), length(node.exist[[t]])) - diag(1, length(node.exist[[t]]), length(node.exist[[t]]))))
+  tmp.obj <- sum(unlist(lapply(1:Ti, function(t) sum(obj1[[t]]))))
+  obj <- c(obj, tmp.obj)
+  
+  
+  if (iter==niter)
+  {cat("Warning! May Not Convergence", "\n")}
+  cat("Number of iterations=",iter,"\n")
+  cat("The objective value=",tmp.obj,"\n")
+  
+  return(list(params=list(Z=Z, alpha=alpha, beta=beta), Theta=Theta.hat, obj=obj, iter=iter))                    
+  
+}
+
+```
+
+## Real data modeling
+
+```{r, warning=FALSE}
+load('keyword_adj_20core.rda')
+
+dim(year_keyword_adj_20core)
+keywords <- rownames(year_keyword_adj_20core)
+N <- dim(year_keyword_adj_20core)[1]
+Ti <- dim(year_keyword_adj_20core)[3]
+
+node_id <- seq(dim(year_keyword_adj_20core)[1])
+rownames(year_keyword_adj_20core) <- node_id
+colnames(year_keyword_adj_20core) <- node_id
+rownames(isnew_keyword_adj_20core) <- node_id
+colnames(isnew_keyword_adj_20core) <- node_id
+
+node.exist <- list()
+node.exist.num <- rep(NA, Ti)
+for (t in 1:Ti) {
+  na.num <- colSums(is.na(year_keyword_adj_20core[,,t]))
+  node.exist[[t]] <- as.numeric(names(na.num[na.num<dim(year_keyword_adj_20core)[1]]))
+  node.exist.num[t] <- length(node.exist[[t]])
+}
+
+A <- list()
+X <- list()
+for (t in 1:Ti) {
+  A[[t]] <- year_keyword_adj_20core[,,t][node.exist[[t]], node.exist[[t]]]
+  X[[t]] <- isnew_keyword_adj_20core[,,t][node.exist[[t]], node.exist[[t]]]
+}
+
+
+new.prop <- c()
+for (t in 1:Ti) {
+  new.prop[t] <- sum(colSums(X[[t]])==dim(X[[t]])[1]-1)/dim(X[[t]])[1]
+}
+
+
+para.ini <- init.func(N=N, D=2, Ti=Ti, node.exist=node.exist, seed=66) 
+result <- opt.func(para.ini$Z, para.ini$alpha, sort(para.ini$beta), A=A, X=X, node.exist, nu=0.6, step.size=5, epsi=0.00001, niter=500, trace=0)
+
+result$params$alpha <- array(result$params$alpha, dim=c(N,1))
+rownames(result$params$alpha) <- keywords
+
+for (t in 1:Ti) {
+  rownames(result$params$Z[[t]]) <- keywords[node.exist[[t]]]
+}
+
+```
+
+## Modeling results
+
+```{r, warning=FALSE}
+result$params$alpha <- array(result$params$alpha, dim=c(length(result$params$alpha),1))
+rownames(result$params$alpha) <- keywords
+for (t in 1:length(result$params$Z)) {
+  rownames(result$params$Z[[t]]) <- keywords[node.exist[[t]]]
+}
+
+Year <- c('1992-1994','1995-1997','1998-2000','2001-2003','2004-2006','2007-2009','2010-2012','2013-2015','2016-2018','2019-2021')
+Beta <- result$params$beta
+df.beta <- data.frame(Year = Year, Beta = Beta)
+df.alpha <- data.frame(alpha = result$params$alpha, keywords = rownames(result$params$alpha))
+df.alpha <- df.alpha[order(-df.alpha$alpha),]
+head(df.alpha,10)
+tail(df.alpha,10)
+
+p1 <- ggplot(data = df.beta, mapping = aes(x = Year, y = Beta, group=1)) + 
+  geom_line()+ 
+  geom_point(size=4)+
+  scale_x_discrete(
+    breaks = c('1992-1994','1995-1997','1998-2000','2001-2003','2004-2006','2007-2009','2010-2012','2013-2015','2016-2018','2019-2021'),
+    label = c('1992-\n1994','1995-\n1997','1998-\n2000','2001-\n2003','2004-\n2006','2007-\n2009','2010-\n2012','2013-\n2015','2016-\n2018','2019-\n2021'))+
+  labs(x = "Period", y = expression(hat(beta)))+  
+  theme_bw()+
+  theme(legend.title=element_blank(),
+        axis.text.x = element_text(size=15),
+        axis.text.y = element_text(size=18),
+        axis.title.x=element_text(size=25),
+        axis.title.y=element_text(size=25),
+        legend.text=element_text(size=16),
+        text=element_text(family="serif"))
+
+p2 <- ggplot(data = df.alpha, mapping = aes(x=alpha))+
+  geom_histogram()+
+  labs(x = expression(hat(alpha)), y = 'Frequency')+  
+  theme_bw()+
+  theme(legend.title=element_blank(),
+        axis.text.x = element_text(size=18),
+        axis.text.y = element_text(size=18),
+        axis.title.x=element_text(size=25),
+        axis.title.y=element_text(size=25),
+        legend.text=element_text(size=16),
+        text=element_text(family="serif"))
+plot_grid(p2, p1, align ="h", rel_widths = c(1/2, 1/2))
+ggsave('beta-alpha.png',width = 18, height = 8, dpi = 300)
+
+#---------------------------------Z estimation----------------------------------
+
+period <- c('1992-1994','1995-1997','1998-2000','2001-2003','2004-2006','2007-2009','2010-2012','2013-2015','2016-2018','2019-2021')
+latent_df <- data.frame(result$params$Z[[1]])
+latent_df$keyword <- rownames(result$params$Z[[1]])
+latent_df$year <- period[1]
+for(i in 2:length(period)){
+  lat0 <- data.frame(result$params$Z[[i]])
+  lat0$keyword <- rownames(result$params$Z[[i]])
+  lat0$year <- period[i]
+  latent_df <- rbind(latent_df, lat0)
+}
+
+
+latent_df$length <- sqrt(latent_df$X1^2 + latent_df$X2^2)
+latent_df <- latent_df[,c('keyword','year','X1','X2','length')]
+
+key1 <- latent_df[latent_df$keyword %in% c('machine learning','variable selection','causal inference','graphical model','linear model'), c('keyword','year','length')]
+ggplot(data = key1,aes(x=year,y=length,group = keyword,color=keyword,shape=keyword))+
+  geom_point(size=4)+
+  geom_line(size=1)+
+  labs(x="Period", y="Magnitude") +
+  scale_color_brewer(palette = "Set1")+
+  theme_bw()+
+  theme(panel.grid=element_blank(),
+        legend.title=element_blank(),
+        axis.text.x = element_text(size=18),
+        axis.text.y = element_text(size=18),
+        axis.title.x=element_text(size=20),
+        axis.title.y=element_text(size=20),
+        legend.text=element_text(size=18),
+        text=element_text(family="serif"),
+        legend.position = "top")
+ggsave("line_plot_latent_space.png", width = 13, height = 8, dpi = 300)
+
+
+
+# inner product
+inner.df.total <- data.frame(matrix(NA,0,4))
+colnames(inner.df.total) <- c('keyword1','keyword2','Freq','Period')
+
+for (t in 1:10) {
+  inner.mat <- matrix(0, dim(result$params$Z[[t]])[1], dim(result$params$Z[[t]])[1])
+  rownames(inner.mat) <- rownames(result$params$Z[[t]])
+  colnames(inner.mat) <- rownames(result$params$Z[[t]])
+  for (i in rownames(result$params$Z[[t]])) {
+    for (j in rownames(result$params$Z[[t]])) {
+      inner.mat[i,j] <- t(result$params$Z[[t]][i,]) %*% result$params$Z[[t]][j,]
+    }
+  }
+  inner.df <- as.data.frame(as.table(inner.mat))
+  inner.df['keyword1'] <- apply(inner.df[c('Var1','Var2')], 1, min)
+  inner.df['keyword2'] <- apply(inner.df[c('Var1','Var2')], 1, max)
+  inner.df <- unique(inner.df[c('keyword1','keyword2','Freq')])
+  inner.df$Period <- period[t]
+  inner.df.total <- rbind(inner.df.total,inner.df)
+}
+
+inner.df.total <- dcast(inner.df.total, keyword1+keyword2~Period, value.var = 'Freq')
+inner.df.total$na.num <- rowSums(is.na(inner.df.total))
+
+Z.sub1 <- inner.df.total[,c(1,2,3)]
+Z.sub1 <- Z.sub1[order(Z.sub1$`1992-1994`, decreasing = TRUE),]
+Z.sub1$same <- apply(Z.sub1, 1, function(x) if(x[1]==x[2]) {1} else {0})
+hot1 <- Z.sub1[Z.sub1$same==1,'keyword1'][1:10]
+latent_df1 <- data.frame(result$params$Z[[1]])
+latent_df1$keyword <- rownames(result$params$Z[[1]])
+latent_df1$type <- 'ordinary'
+latent_df1[latent_df1$keyword %in% hot1, 'type'] <- 'hot'
+latent_df1$sizes <- '1'
+latent_df1[latent_df1$keyword %in% hot1, 'sizes'] <- '2'
+latent_df1$label <- ''
+latent_df1[latent_df1$keyword %in% hot1, 'label'] <- latent_df1[latent_df1$keyword %in% hot1, 'keyword']
+latent_df1[latent_df1$label=='chi squared distribution', 'label'] <- 'chi-squared distribution'
+
+p1 <- ggplot(latent_df1, aes(x=X1, y=X2, colour = type, size=sizes, shape=type))+
+  geom_point()+ 
+  geom_text_repel(aes(x=X1, y=X2, label = label), max.overlaps=Inf, size=6, family="Times", 
+                  box.padding=unit(0.1, "lines"), point.padding=unit(1.6, "lines")) +
+  geom_hline(aes(yintercept=0), linetype="dashed") +
+  geom_vline(aes(xintercept=0), linetype="dashed") +
+  scale_shape_manual(values = c(ordinary = 16, growing = 17, new = 18, hot = 15), guide="none") +
+  scale_size_manual(values = c(1,3), guide="none") +
+  scale_color_manual(values=c(ordinary = "black", growing = "darkolivegreen4", new = "dodgerblue4", hot = "#b20000"), guide="none") +
+  labs(x="Dimension 1", y="Dimension 2") +
+  ggtitle('1992-1994')+
+  theme_bw()+
+  theme(panel.grid=element_blank(),
+        legend.title=element_blank(),
+        axis.text.x = element_text(size=15),
+        axis.text.y = element_text(size=15),
+        axis.title.x=element_text(size=18),
+        axis.title.y=element_text(size=18),
+        legend.text=element_text(size=16),
+        plot.title = element_text(size=16,hjust = 0.5),
+        text=element_text(family="serif"))
+
+
+Z.sub2 <- inner.df.total[,c(1,2,4)]
+Z.sub2 <- Z.sub2[order(Z.sub2$`1995-1997`, decreasing = TRUE),]
+Z.sub2$same <- apply(Z.sub2, 1, function(x) if(x[1]==x[2]) {1} else {0})
+hot2 <- Z.sub2[Z.sub2$same==1,'keyword1'][1:10]
+latent_df2 <- data.frame(result$params$Z[[2]])
+latent_df2$keyword <- rownames(result$params$Z[[2]])
+latent_df2$type <- 'ordinary'
+latent_df2[latent_df2$keyword %in% hot2, 'type'] <- 'hot'
+latent_df2$sizes <- '1'
+latent_df2[latent_df2$keyword %in% hot2, 'sizes'] <- '2'
+latent_df2$label <- ''
+latent_df2[latent_df2$keyword %in% hot2, 'label'] <- latent_df2[latent_df2$keyword %in% hot2, 'keyword']
+latent_df2[latent_df2$label=='bayes factor', 'label'] <- 'Bayes factor'
+latent_df2[latent_df2$label=='hierarchical bayes', 'label'] <- 'hierarchical Bayes'
+latent_df2[latent_df2$label=='hellinger distance', 'label'] <- 'Hellinger distance'
+
+p2 <- ggplot(latent_df2, aes(x=X1, y=X2, colour = type, size=sizes, shape=type))+
+  geom_point()+ 
+  geom_text_repel(aes(x=X1, y=X2, label = label), max.overlaps=Inf, size=6, family="Times", 
+                  force = 1, box.padding=unit(0.07, "lines"), point.padding=unit(0.2, "lines")) +
+  geom_hline(aes(yintercept=0), linetype="dashed") +
+  geom_vline(aes(xintercept=0), linetype="dashed") +
+  scale_shape_manual(values = c(ordinary = 16, growing = 17, new = 18, hot = 15), guide="none") +
+  scale_size_manual(values = c(1,3), guide="none") +
+  scale_color_manual(values=c(ordinary = "black", growing = "darkolivegreen4", new = "dodgerblue4", hot = "#b20000"), guide="none") +
+  labs(x="Dimension 1", y="Dimension 2") +
+  ggtitle('1995-1997')+
+  theme_bw()+
+  theme(panel.grid=element_blank(),
+        legend.title=element_blank(),
+        axis.text.x = element_text(size=15),
+        axis.text.y = element_text(size=15),
+        axis.title.x=element_text(size=18),
+        axis.title.y=element_text(size=18),
+        legend.text=element_text(size=16),
+        plot.title = element_text(size=16,hjust = 0.5),
+        text=element_text(family="serif"))
+
+
+Z.sub3 <- inner.df.total[,c(1,2,5)]
+Z.sub3 <- Z.sub3[order(Z.sub3$`1998-2000`, decreasing = TRUE),]
+Z.sub3$same <- apply(Z.sub3, 1, function(x) if(x[1]==x[2]) {1} else {0})
+hot3 <- Z.sub3[Z.sub3$same==1,'keyword1'][1:10]
+latent_df3 <- data.frame(result$params$Z[[3]])
+latent_df3$keyword <- rownames(result$params$Z[[3]])
+latent_df3$type <- 'ordinary'
+latent_df3[latent_df3$keyword %in% hot3, 'type'] <- 'hot'
+latent_df3$sizes <- '1'
+latent_df3[latent_df3$keyword %in% hot3, 'sizes'] <- '2'
+latent_df3$label <- ''
+latent_df3[latent_df3$keyword %in% hot3, 'label'] <- latent_df3[latent_df3$keyword %in% hot3, 'keyword']
+latent_df3[latent_df3$label=='gibbs sampling', 'label'] <- 'Gibbs sampling'
+
+p3 <- ggplot(latent_df3, aes(x=X1, y=X2, colour = type, size=sizes, shape=type))+
+  geom_point()+ 
+  geom_text_repel(aes(x=X1, y=X2, label = label), max.overlaps=Inf, size=6, family="Times", force = 1,
+                  box.padding=unit(0.4, "lines"), point.padding=unit(0.5, "lines")) +
+  geom_hline(aes(yintercept=0), linetype="dashed") +
+  geom_vline(aes(xintercept=0), linetype="dashed") +
+  scale_shape_manual(values = c(ordinary = 16, growing = 17, new = 18, hot = 15), guide="none") +
+  scale_size_manual(values = c(1,3), guide="none") +
+  scale_color_manual(values=c(ordinary = "black", growing = "darkolivegreen4", new = "dodgerblue4", hot = "#b20000"), guide="none") +
+  labs(x="Dimension 1", y="Dimension 2") +
+  ggtitle('1998-2000')+
+  theme_bw()+
+  theme(panel.grid=element_blank(),
+        legend.title=element_blank(),
+        axis.text.x = element_text(size=15),
+        axis.text.y = element_text(size=15),
+        axis.title.x=element_text(size=18),
+        axis.title.y=element_text(size=18),
+        legend.text=element_text(size=16),
+        plot.title = element_text(size=16,hjust = 0.5),
+        text=element_text(family="serif"))
+
+
+Z.sub4 <- inner.df.total[,c(1,2,6)]
+Z.sub4 <- Z.sub4[order(Z.sub4$`2001-2003`, decreasing = TRUE),]
+Z.sub4$same <- apply(Z.sub4, 1, function(x) if(x[1]==x[2]) {1} else {0})
+hot4 <- Z.sub4[Z.sub4$same==1,'keyword1'][1:10]
+latent_df4 <- data.frame(result$params$Z[[4]])
+latent_df4$keyword <- rownames(result$params$Z[[4]])
+latent_df4$type <- 'ordinary'
+latent_df4[latent_df4$keyword %in% hot4, 'type'] <- 'hot'
+latent_df4$sizes <- '1'
+latent_df4[latent_df4$keyword %in% hot4, 'sizes'] <- '2'
+latent_df4$label <- ''
+latent_df4[latent_df4$keyword %in% hot4, 'label'] <- latent_df4[latent_df4$keyword %in% hot4, 'keyword']
+latent_df4[latent_df4$label=='u statistic', 'label'] <- 'U statistic'
+latent_df4[latent_df4$label=='monte carlo em algorithm', 'label'] <- 'Monte Carlo EM algorithm'
+latent_df4[latent_df4$label=='gibbs sampling', 'label'] <- 'Gibbs sampling'
+latent_df4[latent_df4$label=='goodness of fit', 'label'] <- 'goodness-of-fit'
+
+p4 <- ggplot(latent_df4, aes(x=X1, y=X2, colour = type, size=sizes, shape=type))+
+  geom_point()+ 
+  geom_text_repel(aes(x=X1, y=X2, label = label), max.overlaps=Inf, size=6, family="Times", force=1,
+                  box.padding=unit(0.2, "lines"), point.padding=unit(0.5, "lines")) +
+  geom_hline(aes(yintercept=0), linetype="dashed") +
+  geom_vline(aes(xintercept=0), linetype="dashed") +
+  scale_shape_manual(values = c(ordinary = 16, growing = 17, new = 18, hot = 15), guide="none") +
+  scale_size_manual(values = c(1,3), guide="none") +
+  scale_color_manual(values=c(ordinary = "black", growing = "darkolivegreen4", new = "dodgerblue4", hot = "#b20000"), guide="none") +
+  labs(x="Dimension 1", y="Dimension 2") +
+  ggtitle('2001-2003')+
+  theme_bw()+
+  theme(panel.grid=element_blank(),
+        legend.title=element_blank(),
+        axis.text.x = element_text(size=15),
+        axis.text.y = element_text(size=15),
+        axis.title.x=element_text(size=18),
+        axis.title.y=element_text(size=18),
+        legend.text=element_text(size=16),
+        plot.title = element_text(size=16,hjust = 0.5),
+        text=element_text(family="serif"))
+
+
+Z.sub5 <- inner.df.total[,c(1,2,7)]
+Z.sub5 <- Z.sub5[order(Z.sub5$`2004-2006`, decreasing = TRUE),]
+Z.sub5$same <- apply(Z.sub5, 1, function(x) if(x[1]==x[2]) {1} else {0})
+hot5 <- Z.sub5[Z.sub5$same==1,'keyword1'][1:10]
+latent_df5 <- data.frame(result$params$Z[[5]])
+latent_df5$keyword <- rownames(result$params$Z[[5]])
+latent_df5$type <- 'ordinary'
+latent_df5[latent_df5$keyword %in% hot5, 'type'] <- 'hot'
+latent_df5$sizes <- '1'
+latent_df5[latent_df5$keyword %in% hot5, 'sizes'] <- '2'
+latent_df5$label <- ''
+latent_df5[latent_df5$keyword %in% hot5, 'label'] <- latent_df5[latent_df5$keyword %in% hot5, 'keyword']
+latent_df5[latent_df5$label=='cox model', 'label'] <- 'Cox model'
+latent_df5[latent_df5$label=='nonnormality', 'label'] <- 'non-normality'
+latent_df5[latent_df5$label=='fisher information', 'label'] <- 'Fisher information'
+
+p5 <- ggplot(latent_df5, aes(x=X1, y=X2, colour = type, size=sizes, shape=type))+
+  geom_point()+ 
+  geom_text_repel(aes(x=X1, y=X2, label = label), max.overlaps=Inf, size=6, family="Times", 
+                  box.padding=unit(0.2, "lines"), point.padding=unit(0.5, "lines")) +
+  geom_hline(aes(yintercept=0), linetype="dashed") +
+  geom_vline(aes(xintercept=0), linetype="dashed") +
+  scale_shape_manual(values = c(ordinary = 16, growing = 17, new = 18, hot = 15), guide="none") +
+  scale_size_manual(values = c(1,3), guide="none") +
+  scale_color_manual(values=c(ordinary = "black", growing = "darkolivegreen4", new = "dodgerblue4", hot = "#b20000"), guide="none") +
+  labs(x="Dimension 1", y="Dimension 2") +
+  ggtitle('2004-2006')+
+  theme_bw()+
+  theme(panel.grid=element_blank(),
+        legend.title=element_blank(),
+        axis.text.x = element_text(size=15),
+        axis.text.y = element_text(size=15),
+        axis.title.x=element_text(size=18),
+        axis.title.y=element_text(size=18),
+        legend.text=element_text(size=16),
+        plot.title = element_text(size=16,hjust = 0.5),
+        text=element_text(family="serif"))
+
+
+Z.sub6 <- inner.df.total[,c(1,2,8)]
+Z.sub6 <- Z.sub6[order(Z.sub6$`2007-2009`, decreasing = TRUE),]
+Z.sub6$same <- apply(Z.sub6, 1, function(x) if(x[1]==x[2]) {1} else {0})
+hot6 <- Z.sub6[Z.sub6$same==1,'keyword1'][1:10]
+latent_df6 <- data.frame(result$params$Z[[6]])
+latent_df6$keyword <- rownames(result$params$Z[[6]])
+latent_df6$type <- 'ordinary'
+latent_df6[latent_df6$keyword %in% hot6, 'type'] <- 'hot'
+latent_df6$sizes <- '1'
+latent_df6[latent_df6$keyword %in% hot6, 'sizes'] <- '2'
+latent_df6$label <- ''
+latent_df6[latent_df6$keyword %in% hot6, 'label'] <- latent_df6[latent_df6$keyword %in% hot6, 'keyword']
+latent_df6[latent_df6$label=='james stein estimator', 'label'] <- 'James-Stein estimator'
+
+p6 <- ggplot(latent_df6, aes(x=X1, y=X2, colour = type, size=sizes, shape=type))+
+  geom_point()+ 
+  geom_text_repel(aes(x=X1, y=X2, label = label), max.overlaps=Inf, size=6, family="Times", 
+                  box.padding=unit(0.3, "lines"), point.padding=unit(0.4, "lines")) +
+  geom_hline(aes(yintercept=0), linetype="dashed") +
+  geom_vline(aes(xintercept=0), linetype="dashed") +
+  scale_shape_manual(values = c(ordinary = 16, growing = 17, new = 18, hot = 15), guide="none") +
+  scale_size_manual(values = c(1,3), guide="none") +
+  scale_color_manual(values=c(ordinary = "black", growing = "darkolivegreen4", new = "dodgerblue4", hot = "#b20000"), guide="none") +
+  labs(x="Dimension 1", y="Dimension 2") +
+  ggtitle('2007-2009')+
+  theme_bw()+
+  theme(panel.grid=element_blank(),
+        legend.title=element_blank(),
+        axis.text.x = element_text(size=15),
+        axis.text.y = element_text(size=15),
+        axis.title.x=element_text(size=18),
+        axis.title.y=element_text(size=18),
+        legend.text=element_text(size=16),
+        plot.title = element_text(size=16,hjust = 0.5),
+        text=element_text(family="serif"))
+
+
+Z.sub7 <- inner.df.total[,c(1,2,9)]
+Z.sub7 <- Z.sub7[order(Z.sub7$`2010-2012`, decreasing = TRUE),]
+Z.sub7$same <- apply(Z.sub7, 1, function(x) if(x[1]==x[2]) {1} else {0})
+hot7 <- Z.sub7[Z.sub7$same==1,'keyword1'][1:10]
+latent_df7 <- data.frame(result$params$Z[[7]])
+latent_df7$keyword <- rownames(result$params$Z[[7]])
+latent_df7$type <- 'ordinary'
+latent_df7[latent_df7$keyword %in% hot7, 'type'] <- 'hot'
+latent_df7$sizes <- '1'
+latent_df7[latent_df7$keyword %in% hot7, 'sizes'] <- '2'
+latent_df7$label <- ''
+latent_df7[latent_df7$keyword %in% hot7, 'label'] <- latent_df7[latent_df7$keyword %in% hot7, 'keyword']
+latent_df7[latent_df7$label=='weibull distribution', 'label'] <- 'Weibull distribution'
+
+p7 <- ggplot(latent_df7, aes(x=X1, y=X2, colour = type, size=sizes, shape=type))+
+  geom_point()+ 
+  geom_text_repel(aes(x=X1, y=X2, label = label), max.overlaps=Inf, size=6, family="Times", force=1,
+                  box.padding=unit(0.2, "lines"), point.padding=unit(0.2, "lines")) +
+  geom_hline(aes(yintercept=0), linetype="dashed") +
+  geom_vline(aes(xintercept=0), linetype="dashed") +
+  scale_shape_manual(values = c(ordinary = 16, growing = 17, new = 18, hot = 15), guide="none") +
+  scale_size_manual(values = c(1,3), guide="none") +
+  scale_color_manual(values=c(ordinary = "black", growing = "darkolivegreen4", new = "dodgerblue4", hot = "#b20000"), guide="none") +
+  labs(x="Dimension 1", y="Dimension 2") +
+  ggtitle('2010-2012')+
+  theme_bw()+
+  theme(panel.grid=element_blank(),
+        legend.title=element_blank(),
+        axis.text.x = element_text(size=15),
+        axis.text.y = element_text(size=15),
+        axis.title.x=element_text(size=18),
+        axis.title.y=element_text(size=18),
+        legend.text=element_text(size=16),
+        plot.title = element_text(size=16,hjust = 0.5),
+        text=element_text(family="serif"))
+
+
+Z.sub8 <- inner.df.total[,c(1,2,10)]
+Z.sub8 <- Z.sub8[order(Z.sub8$`2013-2015`, decreasing = TRUE),]
+Z.sub8$same <- apply(Z.sub8, 1, function(x) if(x[1]==x[2]) {1} else {0})
+hot8 <- Z.sub8[Z.sub8$same==1,'keyword1'][1:10]
+latent_df8 <- data.frame(result$params$Z[[8]])
+latent_df8$keyword <- rownames(result$params$Z[[8]])
+latent_df8$type <- 'ordinary'
+latent_df8[latent_df8$keyword %in% hot8, 'type'] <- 'hot'
+latent_df8$sizes <- '1'
+latent_df8[latent_df8$keyword %in% hot8, 'sizes'] <- '2'
+latent_df8$label <- ''
+latent_df8[latent_df8$keyword %in% hot8, 'label'] <- latent_df8[latent_df8$keyword %in% hot8, 'keyword']
+latent_df8[latent_df8$label=='bayesian information criterion', 'label'] <- 'Bayesian information criterion'
+
+p8 <- ggplot(latent_df8, aes(x=X1, y=X2, colour = type, size=sizes, shape=type))+
+  geom_point()+ 
+  geom_text_repel(aes(x=X1, y=X2, label = label), max.overlaps=Inf, size=6, family="Times", force=1,
+                  box.padding=unit(0.09, "lines"), point.padding=unit(0.5, "lines")) +
+  geom_hline(aes(yintercept=0), linetype="dashed") +
+  geom_vline(aes(xintercept=0), linetype="dashed") +
+  scale_shape_manual(values = c(ordinary = 16, growing = 17, new = 18, hot = 15), guide="none") +
+  scale_size_manual(values = c(1,3), guide="none") +
+  scale_color_manual(values=c(ordinary = "black", growing = "darkolivegreen4", new = "dodgerblue4", hot = "#b20000"), guide="none") +
+  labs(x="Dimension 1", y="Dimension 2") +
+  ggtitle('2013-2015')+
+  theme_bw()+
+  theme(panel.grid=element_blank(),
+        legend.title=element_blank(),
+        axis.text.x = element_text(size=15),
+        axis.text.y = element_text(size=15),
+        axis.title.x=element_text(size=18),
+        axis.title.y=element_text(size=18),
+        legend.text=element_text(size=16),
+        plot.title = element_text(size=16,hjust = 0.5),
+        text=element_text(family="serif"))
+
+
+
+Z.sub9 <- inner.df.total[,c(1,2,11)]
+Z.sub9 <- Z.sub9[order(Z.sub9$`2016-2018`, decreasing = TRUE),]
+Z.sub9$same <- apply(Z.sub9, 1, function(x) if(x[1]==x[2]) {1} else {0})
+hot9 <- Z.sub9[Z.sub9$same==1,'keyword1'][1:10]
+latent_df9 <- data.frame(result$params$Z[[9]])
+latent_df9$keyword <- rownames(result$params$Z[[9]])
+latent_df9$type <- 'ordinary'
+latent_df9[latent_df9$keyword %in% hot9, 'type'] <- 'hot'
+latent_df9$sizes <- '1'
+latent_df9[latent_df9$keyword %in% hot9, 'sizes'] <- '2'
+latent_df9$label <- ''
+latent_df9[latent_df9$keyword %in% hot9, 'label'] <- latent_df9[latent_df9$keyword %in% hot9, 'keyword']
+
+p9 <- ggplot(latent_df9, aes(x=X1, y=X2, colour = type, size=sizes, shape=type))+
+  geom_point()+ 
+  geom_text_repel(aes(x=X1, y=X2, label = label), max.overlaps=Inf, size=6, family="Times", 
+                  box.padding=unit(0.15, "lines"), point.padding=unit(0.5, "lines")) +
+  geom_hline(aes(yintercept=0), linetype="dashed") +
+  geom_vline(aes(xintercept=0), linetype="dashed") +
+  scale_shape_manual(values = c(ordinary = 16, growing = 17, new = 18, hot = 15), guide="none") +
+  scale_size_manual(values = c(1,3), guide="none") +
+  scale_color_manual(values=c(ordinary = "black", growing = "darkolivegreen4", new = "dodgerblue4", hot = "#b20000"), guide="none") +
+  labs(x="Dimension 1", y="Dimension 2") +
+  ggtitle('2016-2018')+
+  theme_bw()+
+  theme(panel.grid=element_blank(),
+        legend.title=element_blank(),
+        axis.text.x = element_text(size=15),
+        axis.text.y = element_text(size=15),
+        axis.title.x=element_text(size=18),
+        axis.title.y=element_text(size=18),
+        legend.text=element_text(size=16),
+        plot.title = element_text(size=16,hjust = 0.5),
+        text=element_text(family="serif"))
+
+
+
+Z.sub10 <- inner.df.total[,c(1,2,12)]
+Z.sub10 <- Z.sub10[order(Z.sub10$`2019-2021`, decreasing = TRUE),]
+Z.sub10$same <- apply(Z.sub10, 1, function(x) if(x[1]==x[2]) {1} else {0})
+hot10 <- Z.sub10[Z.sub10$same==1,'keyword1'][1:10]
+latent_df10 <- data.frame(result$params$Z[[10]])
+latent_df10$keyword <- rownames(result$params$Z[[10]])
+latent_df10$type <- 'ordinary'
+latent_df10[latent_df10$keyword %in% hot10, 'type'] <- 'hot'
+latent_df10$sizes <- '1'
+latent_df10[latent_df10$keyword %in% hot10, 'sizes'] <- '2'
+latent_df10$label <- ''
+latent_df10[latent_df10$keyword %in% hot10, 'label'] <- latent_df10[latent_df10$keyword %in% hot10, 'keyword']
+latent_df10[latent_df10$label=='monte carlo simulation', 'label'] <- 'Monte Carlo simulation'
+latent_df10[latent_df10$label=='zero inflation', 'label'] <- 'zero-inflation'
+
+p10 <- ggplot(latent_df10, aes(x=X1, y=X2, colour = type, size=sizes, shape=type))+
+  geom_point()+ 
+  geom_text_repel(aes(x=X1, y=X2, label = label), max.overlaps=Inf, size=6, family="Times", 
+                  box.padding=unit(0.2, "lines"), point.padding=unit(0.5, "lines")) +
+  geom_hline(aes(yintercept=0), linetype="dashed") +
+  geom_vline(aes(xintercept=0), linetype="dashed") +
+  scale_shape_manual(values = c(ordinary = 16, growing = 17, new = 18, hot = 15), guide="none") +
+  scale_size_manual(values = c(1,3), guide="none") +
+  scale_color_manual(values=c(ordinary = "black", growing = "darkolivegreen4", new = "dodgerblue4", hot = "#b20000"), guide="none") +
+  labs(x="Dimension 1", y="Dimension 2") +
+  ggtitle('2019-2021')+
+  theme_bw()+
+  theme(panel.grid=element_blank(),
+        legend.title=element_blank(),
+        axis.text.x = element_text(size=15),
+        axis.text.y = element_text(size=15),
+        axis.title.x=element_text(size=18),
+        axis.title.y=element_text(size=18),
+        legend.text=element_text(size=16),
+        plot.title = element_text(size=16,hjust = 0.5),
+        text=element_text(family="serif"))
+
+
+plot_grid(p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, ncol=3)
+ggsave('Z.png',width = 18, height = 20, dpi = 300)
+
+```
+
+
